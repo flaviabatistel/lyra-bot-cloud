@@ -1,10 +1,19 @@
 import os, time
 import json
+import hmac
+import hashlib
+import httpx
 from datetime import datetime, timezone
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 
 APP_PASSPHRASE = os.getenv("PASS_PHRASE", "")
+BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "")
+BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "")
+FUTURES_BASE_URL = os.getenv("FUTURES_BASE_URL", "https://testnet.binancefuture.com")
+ORDER_USDT = float(os.getenv("ORDER_USDT", "50"))
+LEVERAGE = int(os.getenv("LEVERAGE", "1"))
+
 
 app = FastAPI()
 _ids_processados = set()  # evita executar alerta duplicado
@@ -12,6 +21,22 @@ _ids_processados = set()  # evita executar alerta duplicado
 @app.get("/health")
 def health():
     return {"ok": True, "epoch": int(time.time())}
+
+def _tv_to_binance_symbol(tv_symbol: str) -> str:
+    ...
+
+def _sign(query: str) -> str:
+    ...
+
+async def _binance_futures_set_leverage(...):
+    ...
+
+async def _binance_futures_market_order(...):
+    ...
+
+def _calc_qty_from_usdt(...):
+    ...
+
 
 @app.post("/webhook")
 async def webhook(req: Request):
@@ -70,17 +95,57 @@ async def webhook(req: Request):
           f"symbol={symbol} | price={price_f if price_f is not None else price} | "
           f"tf={tf} | time={time_iso}")
 
-    # 6) Roteamento simples (só printa por enquanto)
+    # 6) Execução real (Binance Futures Testnet)
     if action == "ignore":
         return {"status": "ok", "note": "ignorado", "action": action_raw}
-    if action == "long":
-        print(f"[EXECUTAR] COMPRA {symbol} ~{price} no {tf}")
-    elif action == "short":
-        print(f"[EXECUTAR] VENDA {symbol} ~{price} no {tf}")
-    elif action == "close":
-        print(f"[EXECUTAR] FECHAR {symbol}")
+
+    symbol_b = _tv_to_binance_symbol(symbol)
+    if not BINANCE_API_KEY or not BINANCE_API_SECRET:
+        print("[BINANCE] Faltam credenciais. Configure BINANCE_API_KEY/SECRET.")
+    elif not symbol_b:
+        print("[BINANCE] Símbolo inválido no payload.")
     else:
-        raise HTTPException(status_code=400, detail=f"Ação desconhecida: {action_raw}")
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            try:
+                # garante alavancagem configurada
+                await _binance_futures_set_leverage(client, symbol_b, LEVERAGE)
+            except Exception as e:
+                print(f"[BINANCE] Aviso: set leverage falhou: {e}")
+
+            qty = _calc_qty_from_usdt(price_f or 0.0, ORDER_USDT, LEVERAGE)
+
+            if action == "long":
+                print(f"[EXECUTAR] COMPRA {symbol} ~{price} no {tf} (q={qty})")
+                try:
+                    resp = await _binance_futures_market_order(client, symbol_b, "BUY", qty, reduce_only=False)
+                    print("[BINANCE][BUY] Resp:", resp)
+                except Exception as e:
+                    print("[BINANCE][BUY] ERRO:", e)
+
+            elif action == "short":
+                print(f"[EXECUTAR] VENDA {symbol} ~{price} no {tf} (q={qty})")
+                try:
+                    resp = await _binance_futures_market_order(client, symbol_b, "SELL", qty, reduce_only=False)
+                    print("[BINANCE][SELL] Resp:", resp)
+                except Exception as e:
+                    print("[BINANCE][SELL] ERRO:", e)
+
+            elif action == "close":
+                print(f"[EXECUTAR] FECHAR {symbol} (reduceOnly)")
+                try:
+                    resp1 = await _binance_futures_market_order(client, symbol_b, "SELL", qty, reduce_only=True)
+                    print("[BINANCE][CLOSE->SELL reduceOnly] Resp:", resp1)
+                except Exception as e:
+                    print("[BINANCE][CLOSE->SELL] ERRO:", e)
+                try:
+                    resp2 = await _binance_futures_market_order(client, symbol_b, "BUY", qty, reduce_only=True)
+                    print("[BINANCE][CLOSE->BUY reduceOnly] Resp:", resp2)
+                except Exception as e:
+                    print("[BINANCE][CLOSE->BUY] ERRO:", e)
+
+            else:
+                raise HTTPException(status_code=400, detail=f"Ação desconhecida: {action_raw}")
+
 
     # 7) Resposta mais detalhada
     return {
