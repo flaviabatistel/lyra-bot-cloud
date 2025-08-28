@@ -41,19 +41,49 @@ def health():
     return {"ok": True, "epoch": int(time.time())}
 
 def _tv_to_binance_symbol(tv_symbol: str) -> str:
-    ...
+    # Converte "BINANCE:BTCUSDT" -> "BTCUSDT"
+    if not tv_symbol:
+        return ""
+    parts = str(tv_symbol).split(":")
+    return parts[-1].upper().strip()
 
 def _sign(query: str) -> str:
-    ...
+    return hmac.new(
+        BINANCE_API_SECRET.encode("utf-8"),
+        query.encode("utf-8"),
+        hashlib.sha256
+    ).hexdigest()
 
-async def _binance_futures_set_leverage(...):
-    ...
+async def _binance_futures_set_leverage(client: httpx.AsyncClient, symbol: str, leverage: int):
+    # Opcional: garantir a alavancagem
+    ts = int(time.time() * 1000)
+    params = f"symbol={symbol}&leverage={leverage}&timestamp={ts}&recvWindow=5000"
+    sig = _sign(params)
+    url = f"{FUTURES_BASE_URL}/fapi/v1/leverage?{params}&signature={sig}"
+    headers = {"X-MBX-APIKEY": BINANCE_API_KEY}
+    r = await client.post(url, headers=headers)
+    return r.json()
 
-async def _binance_futures_market_order(...):
-    ...
+async def _binance_futures_market_order(client: httpx.AsyncClient, symbol: str, side: str, qty: float, reduce_only: bool = False):
+    # side: "BUY" ou "SELL"; reduce_only fecha posição sem abrir outra
+    ts = int(time.time() * 1000)
+    q_str = f"{qty:.6f}".rstrip("0").rstrip(".")  # limpa zeros à direita
+    params = f"symbol={symbol}&side={side}&type=MARKET&quantity={q_str}&reduceOnly={'true' if reduce_only else 'false'}&timestamp={ts}&recvWindow=5000"
+    sig = _sign(params)
+    url = f"{FUTURES_BASE_URL}/fapi/v1/order?{params}&signature={sig}"
+    headers = {"X-MBX-APIKEY": BINANCE_API_KEY}
+    r = await client.post(url, headers=headers)
+    return r.json()
 
-def _calc_qty_from_usdt(...):
-    ...
+
+def _calc_qty_from_usdt(price: float, usdt: float, leverage: int = 1, min_qty: float = 0.001) -> float:
+    if not price or price <= 0:
+        return min_qty
+    qty = (usdt * leverage) / float(price)
+    # arredonda para 3 casas decimais (ex.: BTCUSDT min 0.001)
+    qty = max(min_qty, round(qty, 3))
+    return qty
+
 
 
 @app.post("/webhook")
