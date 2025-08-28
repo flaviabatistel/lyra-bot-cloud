@@ -1,18 +1,36 @@
 import os, time
 import json
-import hmac
-import hashlib
-import httpx
 from datetime import datetime, timezone
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
+import hmac
+import hashlib
+import httpx
 
 APP_PASSPHRASE = os.getenv("PASS_PHRASE", "")
+
+def _get_env_float(name: str, default: float) -> float:
+    val = os.getenv(name, "").strip()
+    try:
+        return float(val) if val else default
+    except Exception:
+        print(f"[WARN] {name} inválida: {val!r}. Usando {default}.")
+        return default
+
+def _get_env_int(name: str, default: int) -> int:
+    val = os.getenv(name, "").strip()
+    try:
+        return int(val) if val else default
+    except Exception:
+        print(f"[WARN] {name} inválida: {val!r}. Usando {default}.")
+        return default
+
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "")
 FUTURES_BASE_URL = os.getenv("FUTURES_BASE_URL", "https://testnet.binancefuture.com")
-ORDER_USDT = float(os.getenv("ORDER_USDT", "50"))
-LEVERAGE = int(os.getenv("LEVERAGE", "1"))
+ORDER_USDT = _get_env_float("ORDER_USDT", 50.0)
+LEVERAGE   = _get_env_int("LEVERAGE", 1)
+
 
 
 app = FastAPI()
