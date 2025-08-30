@@ -41,11 +41,13 @@ def health():
     return {"ok": True, "epoch": int(time.time())}
 
 def _tv_to_binance_symbol(tv_symbol: str) -> str:
-    # Converte "BINANCE:BTCUSDT" -> "BTCUSDT"
     if not tv_symbol:
         return ""
-    parts = str(tv_symbol).split(":")
-    return parts[-1].upper().strip()
+    sym = tv_symbol.split(":")[-1].upper().strip()
+    if sym.endswith("USD") and not sym.endswith("USDT"):
+        sym = sym + "T"  # BTCUSD -> BTCUSDT
+    return sym
+
 
 def _sign(query: str) -> str:
     return hmac.new(
@@ -74,6 +76,34 @@ async def _binance_futures_market_order(client: httpx.AsyncClient, symbol: str, 
     headers = {"X-MBX-APIKEY": BINANCE_API_KEY}
     r = await client.post(url, headers=headers)
     return r.json()
+
+async def _binance_futures_income(client: httpx.AsyncClient, symbol: str = "", start_ms: int | None = None, income_type: str = "REALIZED_PNL", limit: int = 20):
+    ts = int(time.time() * 1000)
+    params = []
+    if symbol:
+        params.append(f"symbol={symbol}")
+    params.append(f"incomeType={income_type}")
+    if start_ms:
+        params.append(f"startTime={start_ms}")
+    params.append(f"limit={limit}")  
+    params.append("recvWindow=5000")
+    params.append(f"timestamp={ts}")
+    q = "&".join(params)
+    sig = _sign(q)
+    url = f"{FUTURES_BASE_URL}/fapi/v1/income?{q}&signature={sig}"
+    headers = {"X-MBX-APIKEY": BINANCE_API_KEY}
+    r = await client.get(url, headers=headers)
+    return r.json()
+
+def _sum_recent_realized_pnl(items, symbol: str):
+    try:
+        same = [it for it in items if it.get("symbol") == symbol]
+        if not same:
+            return None, 0
+        pnl_sum = sum(float(it.get("income", 0.0)) for it in same)
+        return pnl_sum, len(same)
+    except Exception:
+        return None, 0
 
 
 def _calc_qty_from_usdt(price: float, usdt: float, leverage: int = 1, min_qty: float = 0.001) -> float:
@@ -190,6 +220,23 @@ async def webhook(req: Request):
                     print("[BINANCE][CLOSE->BUY reduceOnly] Resp:", resp2)
                 except Exception as e:
                     print("[BINANCE][CLOSE->BUY] ERRO:", e)
+
+                # --- PNL REALIZADO (Income History) ---
+                try:
+                    # Busca ganhos/perdas realizados dos últimos 10 minutos para este símbolo
+                    start_ms = int(time.time() * 1000) - 10 * 60 * 1000
+                    income = await _binance_futures_income(client, symbol_b, start_ms, "REALIZED_PNL", 20)
+                    if isinstance(income, list):
+                        pnl_sum, n = _sum_recent_realized_pnl(income, symbol_b)
+                        if pnl_sum is not None:
+                            print(f"[BINANCE][PnL] Realizado recente {symbol_b}: {pnl_sum:.4f} USDT (entradas: {n})")
+                        else:
+                            print(f"[BINANCE][PnL] Nenhum realized PnL encontrado ainda para {symbol_b}.")
+                    else:
+                        print(f"[BINANCE][PnL] Resposta inesperada do income: {income}")
+                except Exception as e:
+                    print(f"[BINANCE][PnL] ERRO ao consultar income: {e}")
+
 
             else:
                 raise HTTPException(status_code=400, detail=f"Ação desconhecida: {action_raw}")
