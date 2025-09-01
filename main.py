@@ -31,8 +31,6 @@ FUTURES_BASE_URL = os.getenv("FUTURES_BASE_URL", "https://testnet.binancefuture.
 ORDER_USDT = _get_env_float("ORDER_USDT", 50.0)
 LEVERAGE   = _get_env_int("LEVERAGE", 1)
 
-
-
 app = FastAPI()
 _ids_processados = set()  # evita executar alerta duplicado
 
@@ -40,14 +38,17 @@ _ids_processados = set()  # evita executar alerta duplicado
 def health():
     return {"ok": True, "epoch": int(time.time())}
 
-def _tv_to_binance_symbol(tv_symbol: str) -> str:
+def tv_to_binance_symbol(tv_symbol: str) -> str:
     if not tv_symbol:
         return ""
     sym = tv_symbol.split(":")[-1].upper().strip()
+    # Corrige BTCUSD -> BTCUSDT (comum em TV)
     if sym.endswith("USD") and not sym.endswith("USDT"):
-        sym = sym + "T"  # BTCUSD -> BTCUSDT
+        sym = sym + "T"
     return sym
 
+def log(msg: str):
+    print(msg, flush=True)
 
 def _sign(query: str) -> str:
     return hmac.new(
@@ -56,8 +57,33 @@ def _sign(query: str) -> str:
         hashlib.sha256
     ).hexdigest()
 
+# =========================
+# Binance Futures (helpers)
+# =========================
+
+async def _binance_futures_get_position_qty(client: httpx.AsyncClient, symbol: str) -> float:
+    """
+    Retorna a posição líquida do símbolo em modo one-way:
+      > 0 = long, < 0 = short, 0 = flat
+    """
+    ts = int(time.time() * 1000)
+    q = f"symbol={symbol}&timestamp={ts}&recvWindow=5000"
+    sig = _sign(q)
+    url = f"{FUTURES_BASE_URL}/fapi/v2/positionRisk?{q}&signature={sig}"
+    headers = {"X-MBX-APIKEY": BINANCE_API_KEY}
+    r = await client.get(url, headers=headers)
+    data = r.json()
+    if isinstance(data, dict):
+        data = [data]
+    for it in data:
+        if it.get("symbol") == symbol:
+            try:
+                return float(it.get("positionAmt", "0"))
+            except Exception:
+                return 0.0
+    return 0.0
+
 async def _binance_futures_set_leverage(client: httpx.AsyncClient, symbol: str, leverage: int):
-    # Opcional: garantir a alavancagem
     ts = int(time.time() * 1000)
     params = f"symbol={symbol}&leverage={leverage}&timestamp={ts}&recvWindow=5000"
     sig = _sign(params)
@@ -67,7 +93,10 @@ async def _binance_futures_set_leverage(client: httpx.AsyncClient, symbol: str, 
     return r.json()
 
 async def _binance_futures_market_order(client: httpx.AsyncClient, symbol: str, side: str, qty: float, reduce_only: bool = False):
-    # side: "BUY" ou "SELL"; reduce_only fecha posição sem abrir outra
+    """
+    side: "BUY" ou "SELL"
+    reduce_only=True fecha posição sem abrir outra (fail-safe contra inversão quando flat)
+    """
     ts = int(time.time() * 1000)
     q_str = f"{qty:.6f}".rstrip("0").rstrip(".")  # limpa zeros à direita
     params = f"symbol={symbol}&side={side}&type=MARKET&quantity={q_str}&reduceOnly={'true' if reduce_only else 'false'}&timestamp={ts}&recvWindow=5000"
@@ -85,7 +114,7 @@ async def _binance_futures_income(client: httpx.AsyncClient, symbol: str = "", s
     params.append(f"incomeType={income_type}")
     if start_ms:
         params.append(f"startTime={start_ms}")
-    params.append(f"limit={limit}")  
+    params.append(f"limit={limit}")
     params.append("recvWindow=5000")
     params.append(f"timestamp={ts}")
     q = "&".join(params)
@@ -105,7 +134,6 @@ def _sum_recent_realized_pnl(items, symbol: str):
     except Exception:
         return None, 0
 
-
 def _calc_qty_from_usdt(price: float, usdt: float, leverage: int = 1, min_qty: float = 0.001) -> float:
     if not price or price <= 0:
         return min_qty
@@ -114,7 +142,71 @@ def _calc_qty_from_usdt(price: float, usdt: float, leverage: int = 1, min_qty: f
     qty = max(min_qty, round(qty, 3))
     return qty
 
+# =========================
+# Roteador de sinais
+# =========================
 
+async def handle_signal(
+    client: httpx.AsyncClient,
+    tv_symbol: str,
+    action: str,
+    qty: float,
+    allow_short: bool = False
+):
+    """
+    action: "BUY" | "SELL" | "SHORT" | "COVER"
+      BUY   -> abre/aumenta LONG
+      SELL  -> fecha LONG (reduceOnly). Se allow_short=True e estiver flat, pode abrir SHORT.
+      SHORT -> abre SHORT explicitamente
+      COVER -> fecha SHORT (reduceOnly)
+    """
+    symbol = tv_to_binance_symbol(tv_symbol)
+    action = (action or "").strip().upper()
+
+    # lê posição atual ( >0 long, <0 short, 0 flat )
+    pos_qty = await _binance_futures_get_position_qty(client, symbol)
+
+    if action == "BUY":
+        resp = await _binance_futures_market_order(client, symbol, side="BUY", qty=qty, reduce_only=False)
+        print(f"[ROUTER] BUY -> OPEN/LONG | pos_before={pos_qty} | resp={resp}", flush=True)
+        return resp
+
+    if action == "SELL":
+        if pos_qty > 0:
+            close_qty = min(qty, pos_qty)
+            resp = await _binance_futures_market_order(client, symbol, side="SELL", qty=close_qty, reduce_only=True)
+            print(f"[ROUTER] SELL -> CLOSE_LONG {close_qty} | pos_before={pos_qty} | resp={resp}", flush=True)
+            return resp
+        else:
+            if allow_short:
+                resp = await _binance_futures_market_order(client, symbol, side="SELL", qty=qty, reduce_only=False)
+                print(f"[ROUTER] SELL -> OPEN/SHORT | pos_before={pos_qty} | resp={resp}", flush=True)
+                return resp
+            else:
+                print(f"[ROUTER] SELL -> SKIP (no long to close; short disabled) | pos={pos_qty}", flush=True)
+                return {"skipped": True, "reason": "no long to close; short disabled"}
+
+    if action == "SHORT":
+        resp = await _binance_futures_market_order(client, symbol, side="SELL", qty=qty, reduce_only=False)
+        print(f"[ROUTER] SHORT -> OPEN/SHORT | pos_before={pos_qty} | resp={resp}", flush=True)
+        return resp
+
+    if action == "COVER":
+        if pos_qty < 0:
+            close_qty = min(qty, abs(pos_qty))
+            resp = await _binance_futures_market_order(client, symbol, side="BUY", qty=close_qty, reduce_only=True)
+            print(f"[ROUTER] COVER -> CLOSE_SHORT {close_qty} | pos_before={pos_qty} | resp={resp}", flush=True)
+            return resp
+        else:
+            print(f"[ROUTER] COVER -> SKIP (no short) | pos={pos_qty}", flush=True)
+            return {"skipped": True, "reason": "no short to close"}
+
+    print(f"[ROUTER] IGNORE action={action}", flush=True)
+    return {"skipped": True, "reason": f"unknown action {action}"}
+
+# =========================
+# Webhook
+# =========================
 
 @app.post("/webhook")
 async def webhook(req: Request):
@@ -140,10 +232,10 @@ async def webhook(req: Request):
     # 4) Extrai campos
     action_raw = (payload.get("action") or "").lower().strip()
     action_map = {
-        "buy": "long",
-        "sell": "short",
+        "buy": "buy",      # <- importante: não mapear para "long"
+        "sell": "sell",    # <- importante: não mapear para "short"
         "close": "close",
-        "long": "long",
+        "long": "buy",
         "short": "short",
         "exit_long": "close",
         "exit_short": "close",
@@ -173,53 +265,40 @@ async def webhook(req: Request):
           f"symbol={symbol} | price={price_f if price_f is not None else price} | "
           f"tf={tf} | time={time_iso}")
 
-    # 6) Execução real (Binance Futures Testnet)
+    # 6) Execução real (Binance Futures - Testnet/Prod conforme base URL)
+    if action is None:
+        raise HTTPException(status_code=400, detail=f"Ação desconhecida: {action_raw}")
+
     if action == "ignore":
         return {"status": "ok", "note": "ignorado", "action": action_raw}
 
-    symbol_b = _tv_to_binance_symbol(symbol)
+    symbol_b = tv_to_binance_symbol(symbol)
     if not BINANCE_API_KEY or not BINANCE_API_SECRET:
         print("[BINANCE] Faltam credenciais. Configure BINANCE_API_KEY/SECRET.")
     elif not symbol_b:
         print("[BINANCE] Símbolo inválido no payload.")
     else:
         async with httpx.AsyncClient(timeout=15.0) as client:
+            # (opcional) garantir alavancagem
             try:
-                # garante alavancagem configurada
                 await _binance_futures_set_leverage(client, symbol_b, LEVERAGE)
             except Exception as e:
                 print(f"[BINANCE] Aviso: set leverage falhou: {e}")
 
             qty = _calc_qty_from_usdt(price_f or 0.0, ORDER_USDT, LEVERAGE)
 
-            if action == "long":
-                print(f"[EXECUTAR] COMPRA {symbol} ~{price} no {tf} (q={qty})")
-                try:
-                    resp = await _binance_futures_market_order(client, symbol_b, "BUY", qty, reduce_only=False)
-                    print("[BINANCE][BUY] Resp:", resp)
-                except Exception as e:
-                    print("[BINANCE][BUY] ERRO:", e)
-
+            # mapeia para os verbos do roteador
+            if action == "buy":
+                await handle_signal(client, symbol, "BUY", qty, allow_short=False)
+            elif action == "sell":
+                # SELL fecha long; só abre short se você decidir (allow_short=True)
+                await handle_signal(client, symbol, "SELL", qty, allow_short=False)
             elif action == "short":
-                print(f"[EXECUTAR] VENDA {symbol} ~{price} no {tf} (q={qty})")
-                try:
-                    resp = await _binance_futures_market_order(client, symbol_b, "SELL", qty, reduce_only=False)
-                    print("[BINANCE][SELL] Resp:", resp)
-                except Exception as e:
-                    print("[BINANCE][SELL] ERRO:", e)
-
+                await handle_signal(client, symbol, "SHORT", qty, allow_short=True)
             elif action == "close":
-                print(f"[EXECUTAR] FECHAR {symbol} (reduceOnly)")
-                try:
-                    resp1 = await _binance_futures_market_order(client, symbol_b, "SELL", qty, reduce_only=True)
-                    print("[BINANCE][CLOSE->SELL reduceOnly] Resp:", resp1)
-                except Exception as e:
-                    print("[BINANCE][CLOSE->SELL] ERRO:", e)
-                try:
-                    resp2 = await _binance_futures_market_order(client, symbol_b, "BUY", qty, reduce_only=True)
-                    print("[BINANCE][CLOSE->BUY reduceOnly] Resp:", resp2)
-                except Exception as e:
-                    print("[BINANCE][CLOSE->BUY] ERRO:", e)
+                # tenta fechar ambos os lados com reduceOnly
+                await handle_signal(client, symbol, "SELL", qty, allow_short=False)   # fecha long
+                await handle_signal(client, symbol, "COVER", qty, allow_short=False)  # fecha short
 
                 # --- PNL REALIZADO (Income History) ---
                 try:
@@ -237,10 +316,9 @@ async def webhook(req: Request):
                 except Exception as e:
                     print(f"[BINANCE][PnL] ERRO ao consultar income: {e}")
 
-
             else:
+                # Não deve acontecer, pois já validamos action acima
                 raise HTTPException(status_code=400, detail=f"Ação desconhecida: {action_raw}")
-
 
     # 7) Resposta mais detalhada
     return {
