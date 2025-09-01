@@ -28,7 +28,7 @@ def _get_env_int(name: str, default: int) -> int:
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "")
 FUTURES_BASE_URL = os.getenv("FUTURES_BASE_URL", "https://testnet.binancefuture.com")
-ORDER_USDT = _get_env_float("ORDER_USDT", 100.0)
+ORDER_USDT = _get_env_float("ORDER_USDT", 200.0)
 LEVERAGE   = _get_env_int("LEVERAGE", 1)
 
 app = FastAPI()
